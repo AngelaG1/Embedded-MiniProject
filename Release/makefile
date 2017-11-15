@@ -14,6 +14,7 @@ ORDERED_OBJS += \
 "./main.obj" \
 "./pin_mux_config.obj" \
 "./startup_ccs.obj" \
+"./timer_if.obj" \
 "../cc3200v1p32.cmd" \
 $(GEN_CMDS__FLAG) \
 -llibc.a \
@@ -158,8 +159,8 @@ LAB1.bin: $(EXE_OUTPUTS)
 # Other Targets
 clean:
 	-$(RM) $(BIN_OUTPUTS__QUOTED)$(EXE_OUTPUTS__QUOTED)
-	-$(RM) "gpio_if.obj" "main.obj" "pin_mux_config.obj" "startup_ccs.obj" 
-	-$(RM) "gpio_if.d" "main.d" "pin_mux_config.d" "startup_ccs.d" 
+	-$(RM) "gpio_if.obj" "main.obj" "pin_mux_config.obj" "startup_ccs.obj" "timer_if.obj" 
+	-$(RM) "gpio_if.d" "main.d" "pin_mux_config.d" "startup_ccs.d" "timer_if.d" 
 	-@echo 'Finished clean'
 	-@echo ' '
 

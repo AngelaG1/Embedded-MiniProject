@@ -1,34 +1,34 @@
 //*****************************************************************************
 //
-// Copyright (C) 2014 Texas Instruments Incorporated - http://www.ti.com/ 
-// 
-// 
-//  Redistribution and use in source and binary forms, with or without 
-//  modification, are permitted provided that the following conditions 
+// Copyright (C) 2014 Texas Instruments Incorporated - http://www.ti.com/
+//
+//
+//  Redistribution and use in source and binary forms, with or without
+//  modification, are permitted provided that the following conditions
 //  are met:
 //
-//    Redistributions of source code must retain the above copyright 
+//    Redistributions of source code must retain the above copyright
 //    notice, this list of conditions and the following disclaimer.
 //
 //    Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the 
-//    documentation and/or other materials provided with the   
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the
 //    distribution.
 //
 //    Neither the name of Texas Instruments Incorporated nor the names of
 //    its contributors may be used to endorse or promote products derived
 //    from this software without specific prior written permission.
 //
-//  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
-//  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
+//  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+//  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
 //  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-//  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
-//  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
-//  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT 
+//  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+//  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+//  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
 //  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
 //  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-//  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
-//  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
+//  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+//  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 //  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 //*****************************************************************************
@@ -36,10 +36,10 @@
 //*****************************************************************************
 //
 // Application Name     - Blinky
-// Application Overview - The objective of this application is to showcase the 
-//                        GPIO control using Driverlib api calls. The LEDs 
-//                        connected to the GPIOs on the LP are used to indicate 
-//                        the GPIO output. The GPIOs are driven high-low 
+// Application Overview - The objective of this application is to showcase the
+//                        GPIO control using Driverlib api calls. The LEDs
+//                        connected to the GPIOs on the LP are used to indicate
+//                        the GPIO output. The GPIOs are driven high-low
 //                        periodically in order to turn on-off the LEDs.
 // Application Details  -
 // http://processors.wiki.ti.com/index.php/CC32xx_Blinky_Application
@@ -76,9 +76,53 @@
 #include "gpio_if.h"
 
 #include "pin_mux_config.h"
+//SPI
+#include "hw_types.h"
+#include "hw_memmap.h"
+#include "hw_common_reg.h"
+#include "hw_ints.h"
+#include "spi.h"
+#include "rom.h"
+#include "rom_map.h"
+#include "utils.h"
+#include "prcm.h"
+#include "uart.h"
+#include "interrupt.h"
+//Timer
+#include "timer_if.h"
+#include "gpio_if.h"
 
+// Common interface includes
+#include "uart_if.h"
+
+
+//
 #define APPLICATION_VERSION     "1.1.1"
+#define SPI_IF_BIT_RATE  100000
+#define GSPI_BASE               0x44021000
+#define MAP_PRCMPeripheralClockGet \
+        PRCMPeripheralClockGet
+#define PRCM_GSPI                 0x00000003
+#define SPI_IF_BIT_RATE  100000
+#define TR_BUFF_SIZE     100
+#define TIMER_CFG_PERIODIC                0x00000022
+#define TIMER_A         0x000000ff
 
+static volatile unsigned long g_ulSysTickValue;
+static volatile unsigned long g_ulBase;
+static volatile unsigned long g_ulADCBase;
+static volatile unsigned long ADCIntNum = 0;
+static volatile unsigned long g_ulIntClearVector;
+unsigned long MotorIntNum;
+
+#define FIFO_ELEMENTS 20
+#define FIFO_SIZE (FIFO_ELEMENTS + 1)
+int FIFO[FIFO_SIZE];
+int FIFO_In, FIFO_Out;
+
+int DataArray[3000];
+int DataIndex = -1;
+int TotalSamples=2800;
 //*****************************************************************************
 //                 GLOBAL VARIABLES -- Start
 //*****************************************************************************
@@ -94,14 +138,23 @@ extern uVectorEntry __vector_table;
 
 
 //*****************************************************************************
-//                      LOCAL FUNCTION PROTOTYPES                           
+//                      LOCAL FUNCTION PROTOTYPES
 //*****************************************************************************
+void FIFO_Init(void);
+int FIFOPush(int);
+int FIFOPop();
+int FIFORead(int);
 int PushRoutine(int);
 int SaturateSpeed(int, int);
+void MotorTurner(int);
+void ADC_Read();
+int DifferenceChecker();
 static void BoardInit(void);
+void TimerMotorIntHandler(void);
+void TimerADCIntHandler(void);
 
 //*****************************************************************************
-//                      LOCAL FUNCTION DEFINITIONS                         
+//                      LOCAL FUNCTION DEFINITIONS
 //*****************************************************************************
 
 //*****************************************************************************
@@ -109,8 +162,8 @@ static void BoardInit(void);
 //! Configures the pins as GPIOs and peroidically toggles the lines
 //!
 //! \param None
-//! 
-//! This function  
+//!
+//! This function
 //!    1. Configures 3 lines connected to LEDs as GPIO
 //!    2. Sets up the GPIO pins as output
 //!    3. Periodically toggles each LED one by one by toggling the GPIO line
@@ -118,6 +171,53 @@ static void BoardInit(void);
 //! \return None
 //
 //*****************************************************************************
+void FIFO_Init(void)
+{
+    FIFO_In= 0;
+    FIFO_Out= 0;
+}
+
+int FIFOPush(int new)
+{
+    if(FIFO_In == (( FIFO_Out - 1 + FIFO_SIZE) % FIFO_SIZE))
+    {
+        return -1; /* FIFO Full*/
+    }
+
+    FIFO[FIFO_In] = new;
+
+    FIFO_In = (FIFO_In + 1) % FIFO_SIZE;
+
+    return 0; // No errors
+}
+
+int FIFOPop()
+{
+    if(FIFO_In == FIFO_Out)
+    {
+        return -1; /* FIFO Empty - nothing to get*/
+    }
+
+    FIFO_Out = (FIFO_Out + 1) % FIFO_SIZE;
+
+    return 0; // No errors
+}
+
+int FIFORead(int element) //element from 0 to FIFO_SIZE-1
+{
+    if(FIFO_In == FIFO_Out)
+    {
+        return -1; /* FIFO Empty - nothing to get*/
+    }
+
+    if(element>9)
+    {
+        return -1; /* Invalid index */
+    }
+
+    return FIFO[(FIFO_Out+element)% FIFO_SIZE];
+}
+
 int PushRoutine(int currentVal)
 {
     if(GPIOPinRead(GPIOA1_BASE, 0x20)){
@@ -151,23 +251,91 @@ int PushRoutine(int currentVal)
     return currentVal;
 }
 
+void MotorTurner(int mode){
+    if(mode==0)
+        GPIOPinWrite(GPIOA0_BASE, 0x78, 0x50);
+    else if(mode==1)
+        GPIOPinWrite(GPIOA0_BASE, 0x78, 0x48);
+    else if(mode==2)
+        GPIOPinWrite(GPIOA0_BASE, 0x78, 0x28);
+    else if(mode==3)
+        GPIOPinWrite(GPIOA0_BASE, 0x78, 0x30);
+}
+
 
 int SaturateSpeed(int current, int finall){
 
     if(current < finall){
-        current=current+4000000;
+        current=current+1;
         if(current > finall)
             current=finall;
     }
 
     if(current > finall){
-        current=current-4000000;
+        current=current-1;
         if(current < finall)
             current=finall;
     }
 
     return current;
 }
+
+void ADC_Read(){
+    unsigned char rx1,rx2;
+    GPIOPinWrite(GPIOA0_BASE, 0x80, 0x00);
+    SPITransfer(GSPI_BASE,0,&rx1,0x01,1);
+    SPITransfer(GSPI_BASE,0,&rx2,0x01,1);
+    FIFOPop();
+    FIFOPush( (((int)rx1 & 0x1F)<<5) + ((int)rx2>>3));
+    GPIOPinWrite(GPIOA0_BASE, 0x80, 0xFF);
+}
+
+void TimerMotorIntHandler(void){
+    //
+    // Clear the timer interrupt.
+    //
+    Timer_IF_InterruptClear(g_ulBase);
+
+    MotorTurner(MotorIntNum%4);
+    MotorIntNum ++;
+
+}
+
+void TimerADCIntHandler(void){
+    //
+    // Clear the timer interrupt.
+    //
+    Timer_IF_InterruptClear(g_ulADCBase);
+
+    ADC_Read();
+    ADCIntNum ++;
+
+}
+
+
+int DifferenceChecker(){
+    int array[10];
+    int i,sum=0;
+
+    //first a more smooth curve is created using average over 10 samples
+    for(i=9; i<18; i++){
+        sum+= FIFORead(i);
+    }
+    array[9]=sum/10;
+    for(i=8; i>=0; i--){
+        sum+= FIFORead(i)-FIFORead(i+10);
+        array[i]= sum/10;
+    }
+
+    //
+    if ((array[0]-array[9]) >14){
+        return ADCIntNum;
+    }
+    return -1;
+}
+
+
+
 //*****************************************************************************
 //
 //! Board Initialization & Configuration
@@ -192,7 +360,7 @@ BoardInit(void)
     MAP_IntVTableBaseSet((unsigned long)&__vector_table);
 #endif
 #endif
-    
+
     //
     // Enable Processor
     //
@@ -206,8 +374,8 @@ BoardInit(void)
 //! Main function
 //!
 //! \param none
-//! 
-//! This function  
+//!
+//! This function
 //!    1. Invokes the LEDBlinkyTask
 //!
 //! \return None.
@@ -216,54 +384,83 @@ BoardInit(void)
 int
 main()
 {
+    int CurrFreq=1, FinalFreq=1;
     //
     // Initialize Board configurations
     //
-    int push=0;
     BoardInit();
-    
+
     //
     // Power on the corresponding GPIO port B for 9,10,11.
     // Set up the GPIO lines to mode 0 (GPIO)
     //
     PinMuxConfig();
+    //
+        // Reset SPI
+        //
+    MAP_PRCMPeripheralReset(PRCM_GSPI);
+    MAP_SPIReset(GSPI_BASE);
 
+        //
+        // Configure SPI interface
+        //
+        MAP_SPIConfigSetExpClk(GSPI_BASE,MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+                         SPI_IF_BIT_RATE,SPI_MODE_MASTER,SPI_SUB_MODE_0,
+                         (SPI_SW_CTRL_CS |
+                         SPI_4PIN_MODE |
+                         SPI_TURBO_OFF |
+                         SPI_CS_ACTIVELOW |
+                         SPI_WL_8));
+
+        //
+        // Enable SPI for communication
+        //
+        MAP_SPIEnable(GSPI_BASE);
+        MAP_SPITransfer(GSPI_BASE,0,0,50,
+                   SPI_CS_ENABLE|SPI_CS_DISABLE);
+
+    MAP_PRCMPeripheralClkEnable(PRCM_GSPI,PRCM_RUN_MODE_CLK);
 
     //push3= GPIOPinRead(GPIOA1_BASE, 0x20);
+
+    //Timer
+    g_ulBase = TIMERA0_BASE;
+    Timer_IF_Init(PRCM_TIMERA0, g_ulBase, TIMER_CFG_PERIODIC, TIMER_A, 0);
+    Timer_IF_IntSetup(g_ulBase, TIMER_A, TimerMotorIntHandler);
+    Timer_IF_Start(g_ulBase, TIMER_A, 25); //25ms for each 7 degrees: 1round per second
+
+    g_ulADCBase = TIMERA1_BASE;
+    Timer_IF_Init(PRCM_TIMERA1, g_ulADCBase, TIMER_CFG_PERIODIC, TIMER_A, 0);
+    Timer_IF_IntSetup(g_ulADCBase, TIMER_A, TimerADCIntHandler);
+    Timer_IF_Start(g_ulADCBase, TIMER_A, 10); //10ms= 100 Hz sampling frequency
 
     GPIO_IF_LedConfigure(LED1|LED2|LED3);
 
     GPIO_IF_LedOff(MCU_ALL_LED_IND);
-    
+
     //
     // Start the LEDBlinkyRoutine
     //
 
+    int LastFound=0,found=0, StartOver=0;
 
-    int i, speed, j=0;
+    GPIOPinWrite(GPIOA0_BASE, 0x80, 0xFF);
+
+    while(ADCIntNum<22);
     while(1){
-        //srand( time(NULL));
-        //j=(rand()%10)+1;
-        push= PushRoutine(push);
-        speed=  SaturateSpeed(speed, 400000/(push+1));
-        GPIOPinWrite(GPIOA0_BASE, 0x78, 0x50);
-        MAP_UtilsDelay(speed);
 
-        push= PushRoutine(push);
-        speed=  SaturateSpeed(speed, 400000/(push+1));
-        GPIOPinWrite(GPIOA0_BASE, 0x78, 0x48);
-        MAP_UtilsDelay(speed);
+        if (StartOver<ADCIntNum){
+            found=DifferenceChecker();
+            if(found != -1){
+                CurrFreq=100/(found-LastFound);
+                LastFound=ADCIntNum;
+                StartOver=ADCIntNum+40;
+                printf("Beats per minute=%d\n",60*CurrFreq);
+            }
+        }
 
-        push= PushRoutine(push);
-        speed=  SaturateSpeed(speed, 400000/(push+1));
-        GPIOPinWrite(GPIOA0_BASE, 0x78, 0x28);
-        MAP_UtilsDelay(speed);
-
-        push= PushRoutine(push);
-        speed=  SaturateSpeed(speed, 400000/(push+1));
-        GPIOPinWrite(GPIOA0_BASE, 0x78, 0x30);
-        MAP_UtilsDelay(speed);
-
+        CurrFreq= SaturateSpeed(CurrFreq, FinalFreq);
+        Timer_IF_ReLoad(g_ulBase, TIMER_A, 25/CurrFreq);
     }
 
     return 0;
